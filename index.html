@@ -1,0 +1,1212 @@
+<!DOCTYPE html>
+<html lang="ko"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>굿팝업 성과 리포트</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&amp;family=DM+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  background-color: #0A0F0C !important;
+  color: #FFFFFF;
+  font-family: 'Noto Sans KR', sans-serif;
+  min-height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 430px;
+  margin: 0 auto;
+  padding-bottom: 100px;
+  background-color: #0A0F0C;
+}
+
+/* ── HEADER ── */
+.rpt-header {
+  background-color: #0A0F0C;
+  padding: 52px 20px 32px;
+  border-bottom: 1px solid #1E2B22;
+  position: relative;
+  overflow: hidden;
+}
+.rpt-header::before {
+  content: '';
+  position: absolute;
+  top: -80px; right: -60px;
+  width: 260px; height: 260px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(72,230,130,0.1) 0%, transparent 65%);
+  pointer-events: none;
+}
+.hdr-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 32px;
+}
+.wordmark {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: #48E682;
+  text-transform: uppercase;
+}
+.period-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background-color: #1A2620;
+  border: 1px solid #2A3D30;
+  border-radius: 20px;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-family: 'DM Mono', monospace;
+  font-size: 11px;
+  color: #9ABBA4;
+}
+.period-pill .dot {
+  width: 5px; height: 5px;
+  background-color: #F5C842;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.hdr-to { font-size: 11px; color: #6B8A74; margin-bottom: 6px; }
+.hdr-company { font-size: 30px; font-weight: 900; color: #FFFFFF; line-height: 1.1; margin-bottom: 10px; }
+.hdr-sub { font-size: 13px; color: #6B8A74; font-weight: 300; }
+.hdr-sub em { color: #48E682; font-style: normal; font-weight: 600; }
+
+/* ── SECTION ── */
+.sec { padding: 28px 20px 0; background-color: #0A0F0C; }
+.sec-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.sec-num { font-family: 'DM Mono', monospace; font-size: 9px; color: #48E682; letter-spacing: 0.12em; opacity: 0.7; }
+.sec-title { font-size: 11px; font-weight: 700; color: #6B8A74; letter-spacing: 0.1em; text-transform: uppercase; }
+.sec-line { flex: 1; height: 1px; background-color: #1E2B22; }
+
+/* ── HERO CARD ── */
+.hero-card {
+  background-color: #0F2018;
+  border: 1px solid #2A5A3A;
+  border-radius: 20px;
+  padding: 28px 24px;
+  position: relative;
+  overflow: hidden;
+}
+.hero-card::after {
+  content: '';
+  position: absolute;
+  top: -50px; right: -50px;
+  width: 160px; height: 160px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(72,230,130,0.12) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #48E682;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 14px;
+}
+.hero-tag-dot {
+  width: 7px; height: 7px;
+  background-color: #48E682;
+  border-radius: 50%;
+  animation: blink 2.2s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+.hero-big {
+  font-family: 'DM Mono', monospace;
+  font-size: 62px;
+  font-weight: 500;
+  color: #FFFFFF;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  margin-bottom: 10px;
+}
+.hero-big .u { font-size: 26px; color: #48E682; margin-left: 4px; }
+.hero-caption { font-size: 12px; color: #7AA886; line-height: 1.7; font-weight: 300; }
+
+/* ── DIGITAL PAIR ── */
+.digital-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.dig-card {
+  background-color: #111A14;
+  border: 1px solid #1E2B22;
+  border-radius: 18px;
+  padding: 20px 16px;
+}
+.dig-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.dig-icon {
+  width: 38px; height: 38px;
+  border-radius: 10px;
+  background-color: #1A2620;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px;
+}
+.dig-badge {
+  font-size: 9px; font-weight: 700;
+  padding: 4px 9px; border-radius: 20px;
+  letter-spacing: 0.08em;
+}
+.dig-badge.g { background-color: #0F2A1A; color: #48E682; border: 1px solid #2A5A3A; }
+.dig-badge.a { background-color: #2A2000; color: #F5C842; border: 1px solid #4A3800; }
+.dig-num {
+  font-family: 'DM Mono', monospace;
+  font-size: 28px; font-weight: 500;
+  color: #FFFFFF; line-height: 1;
+  letter-spacing: -0.02em; margin-bottom: 6px;
+}
+.dig-num .u { font-size: 13px; color: #6B8A74; margin-left: 2px; }
+.dig-label { font-size: 11px; color: #6B8A74; font-weight: 300; line-height: 1.45; }
+
+/* ── SALES HERO ── */
+.sales-hero {
+  background-color: #111A14;
+  border: 1px solid #1E2B22;
+  border-radius: 20px;
+  padding: 22px 22px;
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.sh-left { flex: 1; border-right: 1px solid #1E2B22; padding-right: 20px; }
+.sh-right { flex: 1; padding-left: 20px; }
+.sh-label { font-size: 10px; color: #6B8A74; margin-bottom: 8px; }
+.sh-num { font-family: 'DM Mono', monospace; font-size: 32px; font-weight: 500; color: #FFFFFF; line-height: 1; }
+.sh-num.g { color: #48E682; }
+.sh-num .u { font-size: 14px; color: #6B8A74; margin-left: 2px; }
+.sh-sub { font-size: 10px; color: #4A6652; margin-top: 5px; }
+
+/* ── 품목 리스트 ── */
+.items-list { display: flex; flex-direction: column; gap: 8px; }
+.item-card {
+  background-color: #111A14;
+  border: 1px solid #1E2B22;
+  border-radius: 16px;
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.item-card.top1 {
+  background-color: #0D2018;
+  border-color: #2A5A3A;
+}
+.rank-badge {
+  width: 36px; height: 36px;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'DM Mono', monospace;
+  font-size: 15px; font-weight: 700;
+  flex-shrink: 0;
+}
+.rank-badge.r1 { background-color: #FFD700; color: #1A1100; }
+.rank-badge.r2 { background-color: #9EA8B0; color: #0A0F0C; }
+.rank-badge.r3 { background-color: #B06B32; color: #FFFFFF; }
+.rank-badge.rn { background-color: #1A2620; color: #6B8A74; }
+.item-body { flex: 1; min-width: 0; }
+.item-name { font-size: 14px; font-weight: 600; color: #FFFFFF; margin-bottom: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.item-bar-row { display: flex; align-items: center; gap: 8px; }
+.item-bar-bg { flex: 1; height: 5px; background-color: #1E2B22; border-radius: 3px; overflow: hidden; }
+.item-bar-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #48E682, rgba(72,230,130,0.4)); transition: width 0.7s ease; }
+.item-pct { font-family: 'DM Mono', monospace; font-size: 10px; color: #6B8A74; flex-shrink: 0; width: 30px; text-align: right; }
+.item-right { flex-shrink: 0; text-align: right; }
+.item-qty-num { font-family: 'DM Mono', monospace; font-size: 22px; font-weight: 500; color: #48E682; line-height: 1; }
+.item-qty-unit { font-size: 11px; color: #6B8A74; margin-top: 3px; }
+.item-total { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px 2px; border-top: 1px solid #1E2B22; margin-top: 4px; }
+.item-total-label { font-family: 'DM Mono', monospace; font-size: 10px; color: #4A6652; letter-spacing: 0.1em; }
+.item-total-qty { font-family: 'DM Mono', monospace; font-size: 18px; font-weight: 500; color: #48E682; }
+
+/* ── REACH CARD ── */
+.reach-card {
+  background-color: #0A1E12;
+  border: 1px solid #2A5A3A;
+  border-radius: 22px;
+  padding: 32px 24px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+.reach-card::before {
+  content: '';
+  position: absolute;
+  bottom: -60px; left: 50%;
+  transform: translateX(-50%);
+  width: 220px; height: 220px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(72,230,130,0.1) 0%, transparent 70%);
+}
+.reach-eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 0.18em; color: #48E682; text-transform: uppercase; margin-bottom: 18px; opacity: 0.8; }
+.reach-big { font-family: 'DM Mono', monospace; font-size: 56px; font-weight: 500; color: #FFFFFF; line-height: 1; letter-spacing: -0.03em; margin-bottom: 10px; position: relative; z-index: 1; }
+.reach-big .u { font-size: 24px; color: #48E682; }
+.reach-cap { font-size: 12.5px; color: #6B8A74; line-height: 1.8; font-weight: 300; }
+.reach-cap strong { color: #C8E8D4; font-weight: 600; }
+
+/* ── FOOTER ── */
+.rpt-footer {
+  margin: 12px 20px 0;
+  background-color: #111A14;
+  border-radius: 18px;
+  padding: 20px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.footer-leaf { font-size: 22px; flex-shrink: 0; margin-top: 1px; }
+.footer-text { font-size: 12px; color: #6B8A74; line-height: 1.85; font-weight: 300; }
+.footer-text strong { color: #48E682; font-weight: 600; }
+.footer-text b { color: #C8E8D4; font-weight: 600; }
+
+/* ── FAB ── */
+.fab {
+  position: fixed;
+  bottom: 28px; right: 20px;
+  width: 56px; height: 56px;
+  background-color: #48E682;
+  border-radius: 50%;
+  border: none;
+  font-size: 22px;
+  cursor: pointer;
+  box-shadow: 0 6px 24px rgba(72,230,130,0.4);
+  z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+}
+.fab:active { opacity: 0.85; }
+
+/* ── OVERLAY ── */
+.overlay {
+  position: fixed; inset: 0;
+  background-color: rgba(0,0,0,0.75);
+  z-index: 150;
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.3s;
+}
+.overlay.open { opacity: 1; pointer-events: all; }
+
+/* ── DRAWER ── */
+.drawer {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  max-width: 430px;
+  margin: 0 auto;
+  background-color: #0D1A10;
+  border-top: 1px solid #2A3D30;
+  border-radius: 26px 26px 0 0;
+  max-height: 90dvh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px 20px 0;
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 20px);
+  z-index: 200;
+  transform: translateY(100%);
+  transition: transform 0.38s cubic-bezier(0.32,0.72,0,1);
+}
+.drawer.open { transform: translateY(0); }
+
+.drw-handle { width: 38px; height: 4px; background-color: #2A3D30; border-radius: 2px; margin: 0 auto 16px; }
+
+.drw-head {
+  display: flex; align-items: center; justify-content: space-between;
+  position: sticky; top: 0;
+  background-color: #0D1A10;
+  padding: 4px 0 14px;
+  border-bottom: 1px solid #1E2B22;
+  margin-bottom: 20px;
+  z-index: 2;
+}
+.drw-title { font-size: 17px; font-weight: 700; color: #FFFFFF; }
+.drw-close {
+  width: 44px; height: 44px;
+  background-color: #1A2620;
+  border: 1px solid #2A3D30;
+  border-radius: 50%;
+  color: #9ABBA4;
+  font-size: 18px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fg { margin-bottom: 22px; }
+.fg-title {
+  font-size: 9px; font-weight: 700;
+  color: #48E682; letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 12px; padding-bottom: 8px;
+  border-bottom: 1px solid #1E2B22;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.fg-title-hint { color: #4A6652; font-size: 9px; font-weight: 400; letter-spacing: 0; text-transform: none; }
+
+.f { margin-bottom: 12px; }
+.f label { display: block; font-size: 12px; color: #7AA886; margin-bottom: 7px; }
+.f input {
+  width: 100%;
+  background-color: #162018;
+  border: 1.5px solid #2A3D30;
+  border-radius: 12px;
+  font-size: 16px;
+  padding: 14px 16px;
+  font-family: 'Noto Sans KR', sans-serif;
+  color: #FFFFFF;
+  outline: none;
+  -webkit-appearance: none; appearance: none;
+}
+.f input:focus { border-color: #48E682; background-color: #0F2018; }
+.f input::placeholder { color: #2A3D30; }
+
+/* 숫자 입력 + 고정단위 */
+.num-field {
+  display: flex;
+  align-items: center;
+  background-color: #162018;
+  border: 1.5px solid #2A3D30;
+  border-radius: 12px;
+  overflow: hidden;
+}
+.num-field:focus-within { border-color: #48E682; background-color: #0F2018; }
+.num-field input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  padding: 14px 16px;
+  font-family: 'Noto Sans KR', sans-serif;
+  font-size: 16px;
+  color: #FFFFFF;
+  outline: none;
+  min-width: 0;
+  -moz-appearance: textfield;
+  -webkit-appearance: none; appearance: none;
+}
+.num-field input::-webkit-outer-spin-button,
+.num-field input::-webkit-inner-spin-button { -webkit-appearance: none; }
+.num-unit {
+  flex-shrink: 0;
+  padding: 0 16px 0 2px;
+  font-size: 15px; font-weight: 700;
+  color: #48E682;
+  font-family: 'DM Mono', monospace;
+  pointer-events: none;
+}
+
+/* 품목 에디터 */
+.pe-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
+.pe-item {
+  background-color: #162018;
+  border: 1.5px solid #2A3D30;
+  border-radius: 14px; padding: 16px;
+  position: relative;
+}
+.pe-row { display: grid; grid-template-columns: 1fr 90px; gap: 10px; }
+.pe-lbl { font-size: 11px; color: #7AA886; margin-bottom: 7px; }
+.pe-item input {
+  width: 100%;
+  background-color: #0D1A10;
+  border: 1.5px solid #1E2B22;
+  border-radius: 10px;
+  font-size: 16px; padding: 12px;
+  font-family: 'Noto Sans KR', sans-serif;
+  color: #FFFFFF; outline: none;
+  -webkit-appearance: none; appearance: none;
+}
+.pe-item input:focus { border-color: #48E682; }
+.pe-remove {
+  position: absolute; top: 12px; right: 12px;
+  width: 32px; height: 32px;
+  background-color: rgba(255,70,70,0.12);
+  border: 1px solid rgba(255,70,70,0.2);
+  border-radius: 50%; color: #FF8080;
+  font-size: 14px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 자동합산 미리보기 */
+.auto-total-preview {
+  display: flex; align-items: center; gap: 10px;
+  background-color: #0F2018;
+  border: 1.5px solid #2A5A3A;
+  border-radius: 12px; padding: 16px;
+}
+.atp-label { flex: 1; font-size: 11px; color: #6B8A74; font-weight: 300; line-height: 1.5; }
+.atp-num { font-family: 'DM Mono', monospace; font-size: 22px; font-weight: 500; color: #48E682; }
+.atp-unit { font-size: 13px; color: #48E682; opacity: 0.6; }
+
+.add-btn {
+  width: 100%;
+  background: transparent;
+  border: 1.5px dashed #2A5A3A;
+  border-radius: 12px; padding: 15px;
+  color: #48E682; font-family: 'Noto Sans KR', sans-serif;
+  font-size: 15px; font-weight: 600; cursor: pointer;
+  margin-bottom: 4px;
+  -webkit-tap-highlight-color: transparent;
+}
+.add-btn:active { background-color: #0F2018; }
+
+.apply-btn {
+  position: sticky; bottom: 0;
+  width: 100%;
+  background-color: #48E682; color: #050E08;
+  border: none; border-radius: 14px;
+  padding: 18px; font-family: 'Noto Sans KR', sans-serif;
+  font-size: 16px; font-weight: 700; cursor: pointer;
+  margin-top: 10px; letter-spacing: 0.02em;
+  box-shadow: 0 -16px 28px #0D1A10;
+  z-index: 3;
+  -webkit-tap-highlight-color: transparent;
+}
+.apply-btn:active { opacity: 0.85; }
+
+/* ── ANIMATIONS ── */
+@keyframes fadeUp { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+.fi   { animation: fadeUp 0.65s ease both; }
+.fi-1 { animation-delay: 0.08s; }
+.fi-2 { animation-delay: 0.16s; }
+.fi-3 { animation-delay: 0.24s; }
+.fi-4 { animation-delay: 0.32s; }
+.fi-5 { animation-delay: 0.40s; }
+.fi-6 { animation-delay: 0.48s; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div class="page">
+
+  <!-- HEADER -->
+  <header class="rpt-header fi">
+    <div class="hdr-top">
+      <div class="wordmark">Good Popup</div>
+      <button class="period-pill" onclick="openEditor()">
+        <span class="dot"></span>
+        <span id="d-period">2025년 6월</span>
+      </button>
+    </div>
+    <div class="hdr-to">성과 리포트 수신</div>
+    <div class="hdr-company" id="d-company">한마당</div>
+    <div class="hdr-sub">굿팝업 파트너십 <em id="d-duration">6월 17일 — 6월 20일 (판매 중)</em> 홍보 성과</div>
+  </header>
+
+  <!-- 01 오프라인 -->
+  <div class="sec fi fi-1">
+    <div class="sec-eyebrow">
+      <span class="sec-num">01</span>
+      <span class="sec-title">오프라인 노출</span>
+      <span class="sec-line"></span>
+    </div>
+    <div class="hero-card">
+      <div class="hero-tag"><span class="hero-tag-dot"></span>매장 방문 고객 수</div>
+      <div class="hero-big"><span id="d-visitors">5,373</span><span class="u">명</span></div>
+      <div class="hero-caption">이달 굿윌스토어 전 매장 방문 고객 수<br>브랜드 및 제품에 직접 노출된 인원</div>
+    </div>
+  </div>
+
+  <!-- 02 디지털 -->
+  <div class="sec fi fi-2">
+    <div class="sec-eyebrow">
+      <span class="sec-num">02</span>
+      <span class="sec-title">디지털 채널</span>
+      <span class="sec-line"></span>
+    </div>
+    <div class="digital-pair">
+      <div class="dig-card">
+        <div class="dig-top">
+          <div class="dig-icon">📱</div>
+          <span class="dig-badge g">SMS</span>
+        </div>
+        <div class="dig-num"><span id="d-sms">22,685</span><span class="u">명</span></div>
+        <div class="dig-label">문자 광고<br>수신 인원</div>
+      </div>
+      <div class="dig-card">
+        <div class="dig-top">
+          <div class="dig-icon">📸</div>
+          <span class="dig-badge a">INSTA</span>
+        </div>
+        <div class="dig-num"><span id="d-insta">1,442</span><span class="u">회</span></div>
+        <div class="dig-label">카드뉴스<br>조회수</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 03 판매 성과 -->
+  <div class="sec fi fi-3">
+    <div class="sec-eyebrow">
+      <span class="sec-num">03</span>
+      <span class="sec-title">판매 성과</span>
+      <span class="sec-line"></span>
+    </div>
+    <div class="sales-hero">
+      <div class="sh-left">
+        <div class="sh-label">전체 판매 수량</div>
+        <div class="sh-num g" id="d-total-qty">738<span class="u">개</span></div>
+        <div class="sh-sub">전 품목 합산</div>
+      </div>
+      <div class="sh-right">
+        <div class="sh-label">참여 품목 수</div>
+        <div class="sh-num" id="d-item-count" style="color:#9ABBA4;">1<span class="u" style="color:#6B8A74">개</span></div>
+        <div class="sh-sub">굿팝업 등록 품목</div>
+      </div>
+    </div>
+    <div class="items-list" id="items-display">
+    <div class="item-card top1">
+      <div class="rank-badge r1">🥇</div>
+      <div class="item-body">
+        <div class="item-name">콩국물</div>
+        <div class="item-bar-row">
+          <div class="item-bar-bg"><div class="item-bar-fill" style="width:100%"></div></div>
+          <div class="item-pct">100%</div>
+        </div>
+      </div>
+      <div class="item-right">
+        <div class="item-qty-num">738</div>
+        <div class="item-qty-unit">개 판매</div>
+      </div>
+    </div></div>
+    <div class="item-total">
+      <span class="item-total-label">TOTAL</span>
+      <span class="item-total-qty" id="d-items-total">738개</span>
+    </div>
+  </div>
+
+  <!-- 04 총 홍보 도달 -->
+  <div class="sec fi fi-4">
+    <div class="sec-eyebrow">
+      <span class="sec-num">04</span>
+      <span class="sec-title">총 홍보 도달</span>
+      <span class="sec-line"></span>
+    </div>
+    <div class="reach-card">
+      <div class="reach-eyebrow">이달 총 브랜드 노출</div>
+      <div class="reach-big"><span id="d-total">29,500</span><span class="u">명+</span></div>
+      <div class="reach-cap">
+        오프라인 방문 + SMS 발송 + SNS 조회수 합산<br>
+        이달 <strong id="d-company2">한마당</strong> 브랜드 총 노출 인원
+      </div>
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <div class="sec fi fi-5" style="padding-bottom:0;">
+    <div class="rpt-footer">
+      <div class="footer-leaf">🌿</div>
+      <div class="footer-text">
+        이달 판매 수익은 <strong>굿윌스토어 장애직원 급여</strong>로 전액 사용됩니다.<br>
+        <b id="d-company3">한마당</b>의 참여로 만들어진 소중한 결과입니다.<br>
+        다음 달에도 함께해 주세요. 감사합니다.
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- FAB -->
+<button class="fab" onclick="openEditor()">✏️</button>
+
+<!-- OVERLAY -->
+<div class="overlay" id="overlay" onclick="closeEditor()"></div>
+
+<!-- DRAWER -->
+<div class="drawer" id="drawer">
+  <div class="drw-handle"></div>
+  <div class="drw-head">
+    <div class="drw-title">수치 편집</div>
+    <button class="drw-close" onclick="closeEditor()">✕</button>
+  </div>
+
+  <div class="fg">
+    <div class="fg-title">기본 정보</div>
+    <div class="f"><label>기업명</label><input type="text" id="in-company" value="(주)에코그린" placeholder="기업명"></div>
+    <div class="f"><label>리포트 기간</label><input type="text" id="in-period" value="2025년 6월" placeholder="2025년 6월"></div>
+    <div class="f"><label>팝업 운영 기간</label><input type="text" id="in-duration" value="6월 1일 — 6월 30일" placeholder="6월 1일 — 6월 30일"></div>
+  </div>
+
+  <div class="fg">
+    <div class="fg-title">오프라인 노출</div>
+    <div class="f">
+      <label>매장 방문 고객 수</label>
+      <div class="num-field">
+        <input type="number" id="in-visitors" value="18400" min="0" inputmode="numeric">
+        <span class="num-unit">명</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="fg">
+    <div class="fg-title">디지털 채널</div>
+    <div class="f">
+      <label>SMS 발송 인원</label>
+      <div class="num-field">
+        <input type="number" id="in-sms" value="24500" min="0" inputmode="numeric">
+        <span class="num-unit">명</span>
+      </div>
+    </div>
+    <div class="f">
+      <label>인스타그램 조회수</label>
+      <div class="num-field">
+        <input type="number" id="in-insta" value="9820" min="0" inputmode="numeric">
+        <span class="num-unit">회</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="fg">
+    <div class="fg-title">
+      <span>품목별 판매 수량</span>
+      <span class="fg-title-hint">수량 기준 자동 정렬</span>
+    </div>
+    <div class="pe-list" id="pe-list">
+    <div class="pe-item">
+      <button class="pe-remove" onclick="removeItem(0)">✕</button>
+      <div class="pe-row">
+        <div>
+          <div class="pe-lbl">품목명</div>
+          <input type="text" value="콩국물" placeholder="품목명 입력" oninput="products[0].name=this.value">
+        </div>
+        <div>
+          <div class="pe-lbl">수량(개)</div>
+          <input type="number" value="738" min="0" inputmode="numeric" oninput="products[0].qty=Number(this.value)||0">
+        </div>
+      </div>
+    </div></div>
+    <button class="add-btn" onclick="addItem()">+ 품목 추가</button>
+  </div>
+
+  <div class="fg">
+    <div class="fg-title">총 홍보 도달 <span class="fg-title-hint">위 수치 자동 합산</span></div>
+    <div class="auto-total-preview">
+      <span class="atp-label">방문 + SMS + 인스타 합산</span>
+      <span class="atp-num" id="preview-total">29,500</span>
+      <span class="atp-unit">명+</span>
+    </div>
+  </div>
+
+  <button class="apply-btn" onclick="applyAll()">✅ 리포트에 적용 · 저장</button>
+</div>
+
+<script>
+let products=[{"name":"콩국물","qty":738}];
+
+const RC = ['r1','r2','r3'];
+function rc(i) { return i < 3 ? RC[i] : 'rn'; }
+function numVal(id) { return parseInt(document.getElementById(id)?.value||'0',10)||0; }
+function fmt(n) { return n.toLocaleString('ko-KR'); }
+
+function updatePreview() {
+  const t = numVal('in-visitors') + numVal('in-sms') + numVal('in-insta');
+  const el = document.getElementById('preview-total');
+  if (el) el.textContent = fmt(t);
+}
+
+function renderReport() {
+  const sorted = [...products].filter(p=>p.name).sort((a,b)=>b.qty-a.qty);
+  const maxQty = sorted[0]?.qty || 1;
+  const total  = sorted.reduce((s,p)=>s+p.qty, 0);
+
+  document.getElementById('items-display').innerHTML = sorted.map((p,i) => {
+    const pct      = Math.round((p.qty/maxQty)*100);
+    const sharePct = total>0 ? Math.round((p.qty/total)*100) : 0;
+    return `
+    <div class="item-card${i===0?' top1':''}">
+      <div class="rank-badge ${rc(i)}">${i<3?['🥇','🥈','🥉'][i]:i+1}</div>
+      <div class="item-body">
+        <div class="item-name">${p.name}</div>
+        <div class="item-bar-row">
+          <div class="item-bar-bg"><div class="item-bar-fill" style="width:${pct}%"></div></div>
+          <div class="item-pct">${sharePct}%</div>
+        </div>
+      </div>
+      <div class="item-right">
+        <div class="item-qty-num">${p.qty.toLocaleString()}</div>
+        <div class="item-qty-unit">개 판매</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  const ts = total.toLocaleString();
+  document.getElementById('d-total-qty').innerHTML  = ts+'<span class="u">개</span>';
+  document.getElementById('d-item-count').innerHTML = sorted.length+'<span class="u" style="color:#6B8A74">개</span>';
+  document.getElementById('d-items-total').textContent = ts+'개';
+}
+
+function renderEditorList() {
+  document.getElementById('pe-list').innerHTML = products.map((p,i) => `
+    <div class="pe-item">
+      <button class="pe-remove" onclick="removeItem(${i})">✕</button>
+      <div class="pe-row">
+        <div>
+          <div class="pe-lbl">품목명</div>
+          <input type="text" value="${p.name}" placeholder="품목명 입력" oninput="products[${i}].name=this.value">
+        </div>
+        <div>
+          <div class="pe-lbl">수량(개)</div>
+          <input type="number" value="${p.qty}" min="0" inputmode="numeric" oninput="products[${i}].qty=Number(this.value)||0">
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+function addItem() {
+  products.push({name:'',qty:0});
+  renderEditorList();
+  setTimeout(()=>document.getElementById('pe-list').lastElementChild?.scrollIntoView({behavior:'smooth',block:'center'}),60);
+}
+
+function removeItem(i) {
+  if(products.length<=1) return;
+  products.splice(i,1);
+  renderEditorList();
+}
+
+function openEditor() {
+  renderEditorList(); updatePreview();
+  document.getElementById('drawer').classList.add('open');
+  document.getElementById('overlay').classList.add('open');
+}
+function closeEditor() {
+  document.getElementById('drawer').classList.remove('open');
+  document.getElementById('overlay').classList.remove('open');
+}
+
+function applyAll() {
+  const textMap = {
+    'in-company':  ['d-company','d-company2','d-company3'],
+    'in-period':   ['d-period'],
+    'in-duration': ['d-duration'],
+  };
+  Object.entries(textMap).forEach(([src,dsts])=>{
+    const v=document.getElementById(src)?.value; if(!v) return;
+    dsts.forEach(id=>{const el=document.getElementById(id);if(el)el.textContent=v;});
+  });
+
+  const v=numVal('in-visitors'), s=numVal('in-sms'), g=numVal('in-insta');
+  document.getElementById('d-visitors').textContent=fmt(v);
+  document.getElementById('d-sms').textContent=fmt(s);
+  document.getElementById('d-insta').textContent=fmt(g);
+  document.getElementById('d-total').textContent=fmt(v+s+g);
+
+  renderReport();
+  closeEditor();
+  autoSaveHTML();
+
+  const fab=document.querySelector('.fab');
+  fab.textContent='✅';
+  setTimeout(()=>fab.textContent='✏️',1600);
+}
+
+function autoSaveHTML() {
+  const company  = document.getElementById('in-company')?.value||'기업명';
+  const period   = document.getElementById('in-period')?.value||'';
+  const duration = document.getElementById('in-duration')?.value||'';
+  const visitors = numVal('in-visitors');
+  const sms      = numVal('in-sms');
+  const insta    = numVal('in-insta');
+  const total    = visitors+sms+insta;
+
+  const clone = document.documentElement.cloneNode(true);
+  clone.querySelector('#in-company').value  = company;
+  clone.querySelector('#in-period').value   = period;
+  clone.querySelector('#in-duration').value = duration;
+  clone.querySelector('#in-visitors').value = visitors;
+  clone.querySelector('#in-sms').value      = sms;
+  clone.querySelector('#in-insta').value    = insta;
+
+  const setText=(id,val)=>{const el=clone.querySelector('#'+id);if(el)el.textContent=val;};
+  setText('d-company',company); setText('d-company2',company); setText('d-company3',company);
+  setText('d-period',period); setText('d-duration',duration);
+  setText('d-visitors',fmt(visitors)); setText('d-sms',fmt(sms)); setText('d-insta',fmt(insta));
+  setText('d-total',fmt(total));
+
+  clone.querySelectorAll('script').forEach(sc=>{
+    if(sc.textContent.includes('let products')){
+      sc.textContent=sc.textContent.replace(
+        /let products\s*=\s*\[[\s\S]*?\];/,
+        'let products='+JSON.stringify(products)+';'
+      );
+    }
+  });
+
+  const safeName=(company+'_'+period).replace(/[\\/:*?"<>|\s]/g,'_');
+  const blob=new Blob(['<!DOCTYPE html>\n'+clone.outerHTML],{type:'text/html;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download=safeName+'_굿팝업리포트.html';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url),2000);
+}
+
+document.addEventListener('input',e=>{
+  if(['in-visitors','in-sms','in-insta'].includes(e.target.id)) updatePreview();
+});
+
+renderReport();
+updatePreview();
+</script>
+
+
+</body></html>
